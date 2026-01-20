@@ -1,4 +1,4 @@
-# Prism RAG for ScotAI
+# Prism RAG 
 
 **Prism** is an intelligent, multimodal Retrieval-Augmented Generation (RAG) system designed to provide deep insights across a unified knowledge base. It allows users to query documents (PDF, DOCX, Excel), images, audio, and video using natural language, leveraging state-of-the-art local LLMs and computer vision models.
 
