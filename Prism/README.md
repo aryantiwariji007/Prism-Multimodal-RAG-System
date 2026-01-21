@@ -67,7 +67,6 @@ Ensure Ollama is running and pull the required models:
 ```bash
 ollama pull llama3.2
 ollama pull llava
-ollama pull nomic-embed-text
 ```
 
 ### 2. Backend Setup
