@@ -340,11 +340,39 @@ async def ask_video_question(request: VideoQuestionRequest):
 # Processing status (FIXED)
 # -------------------------------------------------
 
+from .services.ingestion_service import ingestion_service
+
+@app.on_event("startup")
+async def startup_event():
+    await ingestion_service.start()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await ingestion_service.stop()
+
+# -------------------------------------------------
+# Processing status
+# -------------------------------------------------
+
 @app.get("/api/processing-status/{processing_id}")
 async def get_processing_status(processing_id: str):
+    # Check IngestionService first (Persistent)
+    status = ingestion_service.get_status(processing_id)
+    if status:
+        return {
+            "success": True,
+            "file_id": processing_id,
+            "status": status["status"],
+            "percentage": 50 if status["current_step_number"] == 1 else 100, # Approximate
+            "message": status["current_step"],
+            "current_step_number": status["current_step_number"],
+            "total_steps": status["total_steps"],
+            "error_message": status["error_message"],
+        }
+
+    # Fallback to legacy progress service (In-Memory)
     progress = progress_service.get_progress(processing_id)
 
-    # ✅ FIX: return pending instead of 404
     if not progress:
         return {
             "success": True,
@@ -353,7 +381,7 @@ async def get_processing_status(processing_id: str):
             "percentage": 0,
             "message": "Processing not started yet",
             "current_step_number": 0,
-            "total_steps": 3,
+            "total_steps": 2,
             "estimated_remaining": None,
             "error_message": None,
         }
@@ -371,31 +399,7 @@ async def get_processing_status(processing_id: str):
     }
 
 # -------------------------------------------------
-# Background document processing
-# -------------------------------------------------
-
-def process_document_async(file_path: Path, file_id: str, processing_id: str):
-    try:
-        result = qa_service.process_document_with_progress(
-            str(file_path),
-            file_id,
-            processing_id,
-        )
-
-        if result["success"]:
-            progress_service.complete_processing(processing_id)
-        else:
-            progress_service.set_error(
-                processing_id,
-                result.get("error", "Unknown error"),
-            )
-
-    except Exception as e:
-        logger.exception("Background processing failed")
-        progress_service.set_error(processing_id, str(e))
-
-# -------------------------------------------------
-# Upload document (FIXED)
+# Upload document
 # -------------------------------------------------
 
 @app.post("/api/upload")
@@ -419,22 +423,11 @@ async def upload_document(
             detail=f"Unsupported file type: {suffix}",
         )
 
-    processing_id = str(uuid.uuid4())
-    # file_id is used for display, we can keep original name or make unique
-    # To prevent overwrites, we MUST make the filename on disk unique
+    # Use UUID for internal storage
     safe_filename = f"{uuid.uuid4()}_{Path(file.filename).name}"
-    
-    # ✅ FIX: Use safe_filename (UUID) as file_id to assume uniqueness and match processed files
     file_id = safe_filename
     
     upload_path = Path("data/uploads") / safe_filename
-
-    # Debug logging
-    try:
-        with open("data/debug_upload.log", "a") as log:
-            log.write(f"Upload request: file={file.filename}, safe={safe_filename}, folder_id={folder_id}\n")
-    except:
-        pass
 
     with open(upload_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
@@ -443,30 +436,18 @@ async def upload_document(
     if folder_id:
         try:
             folder_service.assign_file(file_id, folder_id)
-            with open("data/debug_upload.log", "a") as log:
-                log.write(f"Assigned {file_id} to {folder_id}\n")
         except Exception as e:
             logger.error(f"Failed to assign file {file_id} to folder {folder_id}: {e}")
-            with open("data/debug_upload.log", "a") as log:
-                log.write(f"Failed assign {file_id} to {folder_id}: {e}\n")
 
-    # ✅ FIX: start progress immediately
-    progress_service.start_processing(processing_id, total_steps=3)
-
-    background_tasks.add_task(
-        process_document_async,
-        upload_path,
-        file_id,
-        processing_id,
-    )
+    # Use IngestionService (Async & Persistent)
+    ingestion_service.add_job(str(upload_path), file_id, folder_id)
 
     return {
         "success": True,
-        # Return cleaned name for UI, but internal ID is safe_filename
         "file_id": file_id,
         "file_name": file.filename,  
-        "progress_id": processing_id,
-        "status_url": f"/api/processing-status/{processing_id}",
+        "progress_id": file_id, # processing_id is same as file_id now
+        "status_url": f"/api/processing-status/{file_id}",
     }
 
 # -------------------------------------------------

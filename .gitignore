@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+
+# Virtual environments
+.venv
+
+# Database
+*.db
+
+# Debug and Test Scripts
+Prism/backend/run_evidence_queries.py
+Prism/backend/run_poc_evaluation.py
+Prism/backend/sweep_ingestion.py
+Prism/diagnose_docs.py
+Prism/backend/force_reingest_quality.py
+Prism/backend/get_system_stats.py

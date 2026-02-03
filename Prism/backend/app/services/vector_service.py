@@ -119,25 +119,84 @@ class VectorStoreService:
         if self.index is None or self.index.ntotal == 0:
             return []
             
-        # PREFIX ADDED HERE for query
-        query_embedding = self._get_embedding(query, prefix="search_query: ").reshape(1, -1)
-        distances, indices = self.index.search(query_embedding, k)
-        
-        results = []
-        for i, idx in enumerate(indices[0]):
-            if idx == -1 or idx >= len(self.metadata):
-                continue
-                
-            item = self.metadata[idx]
-            results.append({
-                "chunk": item,
-                "score": float(distances[0][i])
-            })
+        with self._lock:
+            # PREFIX ADDED HERE for query
+            query_embedding = self._get_embedding(query, prefix="search_query: ").reshape(1, -1)
+            # Fetch more candidates to account for soft-deleted ones
+            fetch_k = min(k * 2 + 100, self.index.ntotal)
+            distances, indices = self.index.search(query_embedding, fetch_k)
             
-        return results
+            results = []
+            if indices.size > 0:
+                 for i, idx in enumerate(indices[0]):
+                    if idx == -1 or idx >= len(self.metadata):
+                        continue
+                        
+                    item = self.metadata[idx]
+                    # Soft delete check
+                    if item.get("deleted", False):
+                        continue
+                        
+                    results.append({
+                        "chunk": item,
+                        "score": float(distances[0][i])
+                    })
+                    if len(results) >= k:
+                        break
+                
+            return results
+
+    def delete_document(self, file_id: str):
+        """Soft delete chunks belonging to a file_id"""
+        with self._lock:
+            count = 0
+            for item in self.metadata:
+                if item.get("file_id") == file_id:
+                    item["deleted"] = True
+                    count += 1
+            if count > 0:
+                self.save_store()
+                logger.info(f"Soft deleted {count} chunks for file_id {file_id}")
+
+    def compact(self):
+        """Rebuild index to remove soft-deleted items (Maintenance)"""
+        with self._lock:
+            logger.info("Starting vector store compaction...")
+            valid_items = [item for item in self.metadata if not item.get("deleted", False)]
+            if len(valid_items) == len(self.metadata):
+                logger.info("No deleted items found. Compaction skipped.")
+                return
+
+            new_index = faiss.IndexFlatL2(self.dimension)
+            
+            # Re-add all vectors
+            # This requires us to HAVE the vectors. 
+            # FAISS IndexFlatL2 stores them. methods like reconstruct_n exist.
+            # But getting them out of flat index one by one might be slow or we can use index.reconstruct_n(0, ntotal)
+            
+            try:
+                if self.index.ntotal > 0:
+                     # Get all vectors
+                     all_vectors = self.index.reconstruct_n(0, self.index.ntotal)
+                     
+                     # Filter
+                     valid_indices = [i for i, item in enumerate(self.metadata) if not item.get("deleted", False)]
+                     
+                     if valid_indices:
+                         valid_vectors = all_vectors[valid_indices]
+                         new_index.add(valid_vectors)
+                     
+                self.index = new_index
+                self.metadata = valid_items
+                self.save_store()
+                logger.info(f"Compaction complete. New size: {self.index.ntotal}")
+                
+            except Exception as e:
+                logger.error(f"Compaction failed: {e}")
 
     def clear(self):
-        self._create_new_index()
-        self.save_store()
+        with self._lock:
+            self._create_new_index()
+            self.save_store()
 
 vector_service = VectorStoreService()

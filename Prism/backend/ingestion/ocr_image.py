@@ -1,12 +1,16 @@
-import logging
-import numpy as np
 import os
 # Disable MKLDNN to avoid "ConvertPirAttribute2RuntimeAttribute" error on some Windows envs
 os.environ["FLAGS_use_mkldnn"] = "0"
 os.environ["FLAGS_enable_mkldnn"] = "0"
+os.environ["FLAGS_mkldnn_deterministic"] = "1"
+import logging
+import numpy as np
 import paddle
 try:
     paddle.set_flags({'FLAGS_use_mkldnn': False})
+    # Also try this for newer paddle versions
+    import paddle.fluid as fluid
+    fluid.core.globals()['FLAGS_use_mkldnn'] = False
 except Exception:
     pass
 

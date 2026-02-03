@@ -275,6 +275,36 @@ class DocumentQAService:
     # Question answering
     # ------------------------------------------------------------------
 
+    def optimize_query(self, query: str) -> str:
+        """
+        Refines the query if it is ambiguous or lacks keywords.
+        Returns the original query if no optimization is needed.
+        """
+        # Heuristic: Skip for very short nav queries or very long specific queries
+        if len(query.split()) > 10:
+            return query 
+
+        prompt = (
+            f"Analyze this search query: '{query}'.\n"
+            "If it is a specific technical question, code, or distinct name, return 'ORIGINAL'.\n"
+            "If it is vague, ambiguous, or conversational (e.g., 'what does it say', 'give me the policy'), "
+            "rewrite it to be a standalone, keyword-rich search query for a corporate knowledge base.\n"
+            "Do NOT add explanations. Return ONLY the rewritten query or 'ORIGINAL'."
+        )
+        
+        try:
+            optimized = ollama_llm.generate_response(prompt).strip()
+            # Cleanup
+            optimized = optimized.replace('"', '').replace("'", "")
+            if "ORIGINAL" in optimized or optimized == query:
+                return query
+            
+            logger.info(f"Query Optimized: '{query}' -> '{optimized}'")
+            return optimized
+        except Exception as e:
+            logger.error(f"Query optimization failed: {e}")
+            return query
+
     def answer_question(
         self,
         question: str,
@@ -283,6 +313,10 @@ class DocumentQAService:
         max_chunks: int = 6
     ) -> Dict:
         start_time = time.time()
+        
+        # 0. Query Optimization
+        search_query = self.optimize_query(question)
+        
         try:
             if not ollama_llm.is_ready():
                 return {
@@ -296,8 +330,8 @@ class DocumentQAService:
             # the best matches *within* that folder.
             search_k = 5000 if (folder_id or file_id) else 100
 
-            # Retrieve candidates from FAISS
-            candidates = vector_service.search(question, k=search_k)
+            # Retrieve candidates from FAISS using OPTIMIZED query
+            candidates = vector_service.search(search_query, k=search_k)
             
             # Filter by folder/file if needed (Client-side filtering for now)
             filtered_candidates = []
@@ -323,28 +357,74 @@ class DocumentQAService:
             
             # Limit for reranker to ensure performance
             # Hybrid Search Strategy: "Keyword Rescue"
-            # Before slicing, we prioritize chunks that clearly contain exact keywords from the query
-            # (especially numbers and proper nouns) which might have low vector scores.
-            
-            # Simple term extraction (numbers and capitalized words) - CLEANED
-            # Remove punctuation like 's or trailing dots to ensure we catch "EPI" from "EPI's"
-            import re
-            cleaned_tokens = re.findall(r'\b[A-Za-z0-9]+\b', question)
-            query_terms = [t for t in cleaned_tokens if len(t) > 2 and (t[0].isupper() or t.isdigit())]
-            
-            if query_terms:
+                # KEYWORD RESCUE STRATEGY
+                # Even if vector search score is low, if the chunk matches specific high-value terms
+                # from the query (like "QD040", "Triage"), we rescue it.
+                
+                # Extract potential "Codes" vs "Common Words"
+                # A code is:
+                # 1. Alphanumeric mixed (e.g. QD040)
+                # 2. Capitalized words (e.g. Triage, Nurse)
+                # 3. Hyphenated technical terms (e.g. Safety-Critical)
+                import re
+                
+                # 1. Extract significant terms: Capitals, Alphanumerics, Digits
+                # This regex captures: 
+                # - [A-Z][a-zA-Z0-9-]* : Capitalized words potentially with numbers/dashes (e.g. Triage, QD-040)
+                # - [a-zA-Z]*\d+...    : Words starting with lowercase but containing digits (e.g. v1, 2024-report)
+                query_terms_raw = re.findall(r'\b[A-Z][a-zA-Z0-9-]*\b|\b[a-zA-Z]*\d+[a-zA-Z0-9-]*\b', question)
+                query_terms = set(query_terms_raw)
+                
+                # 2. Extract ALL words for strict filename matching (to catch "policy" in "HR Policy.pdf")
+                all_query_words = set(re.findall(r'\b[a-zA-Z0-9-]+\b', question.lower()))
+
                 rescued_candidates = []
                 other_candidates = []
                 
+                start_filter_time = time.time()
+                
                 for cand in filtered_candidates:
-                    text = cand["chunk"].get("text", "")
-                    # Check for simple substring match of significant terms
-                    if any(term in text for term in query_terms):
+                    chunk = cand["chunk"] # This is usually how it's structured in memory before flatten
+                    # Depending on how candidates coming from vector_service are structured
+                    # vector_service.search returns list of metadata dicts directly mixed?
+                    # Let's check vector_service.search output. It returns list of dicts.
+                    # so cand is the dict.
+                    
+                    text = cand.get("text", "").lower()
+                    file_id = cand.get("file_id")
+                    
+                    # 1. Filename Match
+                    file_name = ""
+                    if file_id in self.document_metadata:
+                        file_name = self.document_metadata[file_id].get("file_name", "").lower()
+                    
+                    filename_match = False
+                    if file_name:
+                         # Split filename into searchable tokens too
+                         file_words = set(re.findall(r'\b[a-zA-Z0-9-]+\b', file_name))
+                         
+                         common_words = all_query_words.intersection(file_words)
+                         # Ignore very common words in filename match
+                         common_words = {w for w in common_words if len(w) > 3}
+                         if common_words:
+                             filename_match = True
+
+                    # 2. Term match (Names, Numbers)
+                    text_match = False
+                    for term in query_terms:
+                        t_lower = term.lower()
+                        if len(t_lower) < 3: 
+                            continue # Skip very short codes to avoid false positives
+                        if t_lower in text:
+                            text_match = True
+                            break
+                    
+                    if filename_match or text_match:
                         rescued_candidates.append(cand)
                     else:
                         other_candidates.append(cand)
                 
-                # Combine: prioritized first, then others (preserving vector rank order within groups)
+                # Combine: prioritized first, then others
                 filtered_candidates = rescued_candidates + other_candidates
                 
             # Increased limit to 1000 for better recall (handling folder scopes where relevant docs might be deep)
