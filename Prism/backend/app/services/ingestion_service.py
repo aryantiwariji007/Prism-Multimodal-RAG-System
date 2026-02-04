@@ -10,7 +10,7 @@ from enum import Enum
 from typing import Optional, Dict, List
 
 # Imports from existing modules
-from ..services.vector_service import vector_service
+from ..services.qdrant_service import qdrant_service
 from ..services.audit_service import audit_service
 from ingestion.parse_pdf import parse_document
 from ingestion.chunker import document_chunker
@@ -193,11 +193,13 @@ class IngestionService:
             # Run Stage 1
             chunks = await asyncio.to_thread(self._run_stage_1, file_path, file_id)
             
+            metadata = None
+
             # Commit Stage 1 to Vector DB
             # Note: We do this even if Stage 1 yields partial results
             if chunks:
-                await asyncio.to_thread(vector_service.add_documents, chunks)
-                logger.info(f"Stage 1 Complete for {file_id}: {len(chunks)} text chunks indexed.")
+                await asyncio.to_thread(qdrant_service.add_documents, chunks)
+                logger.info(f"Stage 1 Complete for {file_id}: {len(chunks)} text chunks indexed in Qdrant.")
                 
                 # --- SAVE METADATA (Critical for System Visibility) ---
                 # Update QA Service in-memory and persistent JSON
@@ -219,17 +221,6 @@ class IngestionService:
                 qa_service.document_chunks[file_id] = chunks
                 qa_service.document_metadata[file_id] = metadata
                 
-                # 2. Add to Chroma (New - for Parity Check)
-                try:
-                    from app.services.llama_service import llama_service
-                    # Convert chunks to TextNodes
-                    # Note: llama_service.create_nodes_from_chunks expects metadata as a dict, not a qa_service object.
-                    # We pass the 'metadata' dict created above.
-                    nodes = llama_service.create_nodes_from_chunks(chunks, metadata)
-                    await asyncio.to_thread(llama_service.add_nodes, nodes)
-                    logger.info(f"Successfully ingested {len(nodes)} nodes into ChromaDB for {file_id}.")
-                except Exception as e:
-                    logger.error(f"Failed to ingest into ChromaDB for {file_id}: {e}")
 
                 # Save JSON
                 await asyncio.to_thread(
@@ -248,15 +239,27 @@ class IngestionService:
                 # Run Stage 2
                 enrichment_chunks = await asyncio.to_thread(self._run_stage_2, file_path, file_id)
                 if enrichment_chunks:
-                     await asyncio.to_thread(vector_service.add_documents, enrichment_chunks)
-                     logger.info(f"Stage 2 Complete for {file_id}: {len(enrichment_chunks)} enrichment chunks indexed.")
+                     await asyncio.to_thread(qdrant_service.add_documents, enrichment_chunks)
+                     logger.info(f"Stage 2 Complete for {file_id}: {len(enrichment_chunks)} enrichment chunks indexed in Qdrant.")
                      
                      # Update Metadata with new chunks
                      all_chunks = chunks + enrichment_chunks
+                     
+                     if metadata is None:
+                         metadata = {
+                            "file_id": file_id,
+                            "file_name": file_path.name,
+                            "file_path": str(file_path),
+                            "type": file_path.suffix.replace('.', ''),
+                            "ingestion_status": "partial"
+                        }
+
                      metadata["num_chunks"] = len(all_chunks)
                      metadata["total_characters"] = sum(len(c.get("text", "")) for c in all_chunks)
                      metadata["ingestion_status"] = "completed"
                      
+                     # Check if qa_service uses lazy loading, but here we push data directly
+                     from ..services.qa_service import qa_service
                      qa_service.document_chunks[file_id] = all_chunks
                      qa_service.document_metadata[file_id] = metadata
                      
@@ -306,7 +309,7 @@ class IngestionService:
             chunks = ingest_excel(str(file_path), file_id=file_id)
         elif suffix in {'.txt', '.md', '.json', '.xml', '.html'}:
              text = file_path.read_text(encoding='utf-8', errors='replace')
-             chunks = document_chunker.chunk_document_pages([{"text": text, "page": 1, "file_id": file_id}])
+             chunks = document_chunker.chunk_document_pages([{"text": text, "page": 1, "file_id": file_id}], file_name=file_path.name)
         
         # Mandatory Metadata Enrichment & Validation
         for i, chunk in enumerate(chunks):
@@ -435,7 +438,7 @@ class IngestionService:
                     
                     if page_text.strip():
                         # Chunk the OCR text
-                        page_chunks = document_chunker.chunk_text(page_text, file_id)
+                        page_chunks = document_chunker.chunk_text(page_text, file_id, file_name=file_path.name)
                         for c in page_chunks:
                             c["page"] = i + 1
                         ocr_chunks.extend(page_chunks)

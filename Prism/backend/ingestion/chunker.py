@@ -40,7 +40,7 @@ class DocumentChunker:
         # Define separators for recursive splitting (in order of priority)
         self.separators = ["\n\n", "\n", " ", ""]
 
-    def chunk_structured_content(self, items: List[Dict], file_id: str) -> List[Dict]:
+    def chunk_structured_content(self, items: List[Dict], file_id: str, file_name: str = None) -> List[Dict]:
         """
         Chunk a list of structured items (Text, Heading, Table).
         Respects semantic boundaries (Headers reset context).
@@ -71,7 +71,7 @@ class DocumentChunker:
                 
                 # Flush existing text irrespective of size to respect section boundaries
                 if current_chunk_text: 
-                    chunks.append(self._create_chunk(current_chunk_text, file_id, chunk_counter, current_metadata, page_num))
+                    chunks.append(self._create_chunk(current_chunk_text, file_id, chunk_counter, current_metadata, page_num, file_name=file_name))
                     chunk_counter += 1
                     current_chunk_text = []
                     current_chunk_char_count = 0
@@ -92,12 +92,12 @@ class DocumentChunker:
                 # Flush previous context regardless of size to maintain order
                 # (Text comes before Table in document -> Text Chunk before Table Chunk)
                 if current_chunk_text:
-                    chunks.append(self._create_chunk(current_chunk_text, file_id, chunk_counter, current_metadata, page_num))
+                    chunks.append(self._create_chunk(current_chunk_text, file_id, chunk_counter, current_metadata, page_num, file_name=file_name))
                     chunk_counter += 1
                     current_chunk_text = []
                     current_chunk_char_count = 0
                 
-                chunks.append(self._create_chunk([text], file_id, chunk_counter, current_metadata, page_num, chunk_type="table"))
+                chunks.append(self._create_chunk([text], file_id, chunk_counter, current_metadata, page_num, chunk_type="table", file_name=file_name))
                 chunk_counter += 1
                 continue
 
@@ -106,7 +106,7 @@ class DocumentChunker:
             if current_chunk_char_count + len(text) > self.chunk_size:
                 # Flush current
                 if current_chunk_text:
-                    chunks.append(self._create_chunk(current_chunk_text, file_id, chunk_counter, current_metadata, page_num))
+                    chunks.append(self._create_chunk(current_chunk_text, file_id, chunk_counter, current_metadata, page_num, file_name=file_name))
                     chunk_counter += 1
                     current_chunk_text = []
                     current_chunk_char_count = 0
@@ -115,7 +115,7 @@ class DocumentChunker:
                 if len(text) > self.chunk_size:
                     split_texts = self._recursive_split(text, self.separators)
                     for st in split_texts:
-                        chunks.append(self._create_chunk([st], file_id, chunk_counter, current_metadata, page_num))
+                        chunks.append(self._create_chunk([st], file_id, chunk_counter, current_metadata, page_num, file_name=file_name))
                         chunk_counter += 1
                 else:
                     current_chunk_text.append(text)
@@ -126,11 +126,11 @@ class DocumentChunker:
 
         # Flush remainder
         if current_chunk_text:
-            chunks.append(self._create_chunk(current_chunk_text, file_id, chunk_counter, current_metadata, page_num))
+            chunks.append(self._create_chunk(current_chunk_text, file_id, chunk_counter, current_metadata, page_num, file_name=file_name))
         
         return chunks
 
-    def _create_chunk(self, text_list, file_id, chunk_id, metadata, page, chunk_type="text"):
+    def _create_chunk(self, text_list, file_id, chunk_id, metadata, page, chunk_type="text", file_name=None):
         """
         Creates a chunk with injected context and mandatory metadata.
         """
@@ -139,7 +139,9 @@ class DocumentChunker:
         # 1. Inject Parent Context (Crucial for RAG Accuracy)
         section = metadata.get("section_title", "General")
         parents = " > ".join(metadata.get("parent_titles", []))
-        prefix = f"[Document: {file_id}]\n"
+        # Use Filename if available, else ID
+        doc_label = file_name if file_name else file_id
+        prefix = f"[Document: {doc_label}]\n"
         if parents:
             prefix += f"[Context: {parents}]\n"
         prefix += f"[Section: {section}]\n"
@@ -169,18 +171,19 @@ class DocumentChunker:
             "metadata": chunk_meta
         }
 
-    def chunk_text(self, text: str, file_id: str) -> List[Dict]:
+    def chunk_text(self, text: str, file_id: str, file_name: str = None) -> List[Dict]:
         """
         Legacy wrapper for unstructured text.
         Treats entire text as one section "General Content".
         """
         items = [{"type": "text", "text": text, "page": 0}]
-        return self.chunk_structured_content(items, file_id)
+        return self.chunk_structured_content(items, file_id, file_name=file_name)
 
     def chunk_document_pages(
         self,
         pages: List[Dict],
-        progress_file_id: str = None
+        progress_file_id: str = None,
+        file_name: str = None
     ) -> List[Dict]:
         """
         Chunk a document already split into pages
@@ -200,7 +203,8 @@ class DocumentChunker:
 
             page_chunks = self.chunk_text(
                 page.get("text", ""),
-                page.get("file_id")
+                page.get("file_id"),
+                file_name=file_name
             )
 
             for chunk in page_chunks:

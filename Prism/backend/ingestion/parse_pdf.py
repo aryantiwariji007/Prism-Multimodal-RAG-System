@@ -178,7 +178,8 @@ def parse_pdf(path, file_id=1, progress_file_id=None):
         return _parse_pdf_fallback(path, file_id, progress_file_id)
 
     # Chunk result
-    chunks = document_chunker.chunk_structured_content(structured_items, file_id)
+    file_name = os.path.basename(path)
+    chunks = document_chunker.chunk_structured_content(structured_items, file_id, file_name=file_name)
     return chunks
 
 def _parse_pdf_fallback(path, file_id, progress_file_id):
@@ -294,7 +295,8 @@ def parse_docx(path, file_id=1, progress_file_id=None):
 
     from ingestion.chunker import document_chunker
     # Use the new structured chunker
-    chunks = document_chunker.chunk_structured_content(structured_items, file_id)
+    file_name = os.path.basename(path)
+    chunks = document_chunker.chunk_structured_content(structured_items, file_id, file_name=file_name)
 
     if progress_service and progress_file_id:
         progress_service.update_progress(progress_file_id, 1, "DOCX structure parsing completed", 100)
