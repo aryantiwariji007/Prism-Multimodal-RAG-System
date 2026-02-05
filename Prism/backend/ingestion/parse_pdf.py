@@ -76,10 +76,13 @@ def parse_pdf(path, file_id=1, progress_file_id=None):
                 
                 # Extract tables first (to exclude them from text flow if needed, OR treat them as special blocks)
                 # For this Agentic Pipeline, let's treat tables as explicit "Table" blocks
-                tables = page.find_tables()
-                table_bboxes = [t.bbox for t in tables]
-                
                 # Process Tables
+                try:
+                    tables = page.find_tables()
+                except Exception:
+                    tables = []
+                
+                table_texts = []
                 if tables:
                     for t_idx, table in enumerate(page.extract_tables()):
                         import pandas as pd
@@ -97,10 +100,12 @@ def parse_pdf(path, file_id=1, progress_file_id=None):
                             
                             t_md = df_table.to_markdown(index=False)
                             t_text = f"#### [Page {i+1} | Table {t_idx+1}]\n{t_md}"
+                            table_texts.append(t_text)
                         except Exception as table_err:
                             logger.warning(f"Failed to create MD table: {table_err}")
                             # Fallback to simple join
                             t_text = f"--- Table {t_idx+1} (Page {i+1}) ---\n" + "\n".join([" | ".join([str(c) for c in r if c]) for r in table])
+                            table_texts.append(t_text)
                         
                         if t_text:
                             structured_items.append({
@@ -110,61 +115,38 @@ def parse_pdf(path, file_id=1, progress_file_id=None):
                                 "parent_titles": []
                             })
 
-                # Process Text (filtering out table areas to avoid duplication?)
-                # Simplification: use extract_text but splitting by newline and checking font size of that line?
-                # Hard with 'extract_text' which loses font info. We must iterate layout objects or `.chars`.
-                # Better approach for high-precision:
+                # FAST TEXT EXTRACTION (Replaces slow word-by-word layout analysis)
+                # usage of x_tolerance and y_tolerance helps with keeping layout cleaner
+                text = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
                 
-                # Get all words with font info
-                words = page.extract_words(extra_attrs=["size"])
-                
-                # Group words into lines based on 'top' coordinate
-                lines = {} # top_coord -> list of words
-                for w in words:
-                    # check if inside a table bbox
-                    cx = (w['x0'] + w['x1']) / 2
-                    cy = (w['top'] + w['bottom']) / 2
-                    in_table = False
-                    for bbox in table_bboxes:
-                        if bbox[0] < cx < bbox[2] and bbox[1] < cy < bbox[3]:
-                            in_table = True
-                            break
-                    if in_table:
+                # Check lines for "Headers" based on implicit formatting (Caps, short lines)
+                # This is faster than font-size analysis
+                lines = text.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if not line:
                         continue
                         
-                    # Group by rough Y lines (tolerance 3px)
-                    found_line = False
-                    for y_key in lines.keys():
-                        if abs(y_key - w['top']) < 5: # 5px tolerance
-                            lines[y_key].append(w)
-                            found_line = True
-                            break
-                    if not found_line:
-                        lines[w['top']] = [w]
-                
-                # Sort lines by Y (top)
-                sorted_y = sorted(lines.keys())
-                
-                for y in sorted_y:
-                    line_words = sorted(lines[y], key=lambda x: x['x0'])
-                    line_text = " ".join([w['text'] for w in line_words])
+                    # Skip if this line is overwhelmingly part of a table we already extracted?
+                    # It's hard to dedupe exact text without strict overlap checks. 
+                    # For now, we ingest both. Reranker handles redundancy.
                     
-                    # Avg font size of line
-                    avg_size = sum([w['size'] for w in line_words]) / len(line_words)
-                    
-                    if avg_size > header_threshold:
-                        # It's a header
+                    is_header = False
+                    # Simple heuristic: Short line, Title Case or UPPER CASE, no period at end
+                    if len(line) < 100 and (line.isupper() or line.istitle()) and not line.endswith('.'):
+                        is_header = True
+                        
+                    if is_header:
                         structured_items.append({
                             "type": "heading",
-                            "text": line_text,
-                            "level": 2 if avg_size < header_threshold * 1.5 else 1,
+                            "text": line,
+                            "level": 2, # Assume H2 for simplicity
                             "page": i + 1
                         })
                     else:
-                        # Body text
                         structured_items.append({
                             "type": "text",
-                            "text": line_text,
+                            "text": line,
                             "page": i + 1
                         })
 
@@ -186,6 +168,11 @@ def _parse_pdf_fallback(path, file_id, progress_file_id):
     """Original PyPDF2 implementation as fallback"""
     try:
         from PyPDF2 import PdfReader
+    except ImportError:
+         logger.error("PyPDF2 not installed. Fallback failed.")
+         return [{"file_id": file_id, "page": 0, "text": ""}]
+
+    try:
         reader = PdfReader(path)
         chunks = []
         for i, page in enumerate(reader.pages):

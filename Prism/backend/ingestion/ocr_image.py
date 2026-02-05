@@ -27,23 +27,35 @@ class PrismOCR:
         return cls._instance
 
     def __init__(self):
-        if hasattr(self, "initialized"):
+        if hasattr(self, 'initialized') and self.initialized:
             return
-        self.initialized = True
+        self.ocr = None
+        self.initialized = False
+
+    def _initialize(self):
+        if self.initialized:
+            return
+        
         logger.info("Initializing PaddleOCR...")
         try:
-            # Lazy import to avoid DLL load errors on startup if dependencies are broken
+            # Lazy import to avoid DLL load errors on startup
             from paddleocr import PaddleOCR
             
-            # use_angle_cls=False to avoid OneDNN/MKLDNN crash on Windows
-            # lang='en' by default, can be made configurable
-            self.ocr = PaddleOCR(use_angle_cls=False, lang='en', use_gpu=False, show_log=False)
+            # In PaddleOCR 3.x, use 'device' instead of 'use_gpu'
+            # 'use_angle_cls' is replaced by 'use_textline_orientation'
+            # 'enable_mkldnn=False' is crucial for some Windows environments
+            self.ocr = PaddleOCR(
+                use_textline_orientation=False, 
+                lang='en', 
+                device='cpu',
+                enable_mkldnn=False
+            )
+            self.initialized = True
             logger.info("PaddleOCR initialized successfully.")
         except Exception as e:
             logger.error(f"Failed to initialize PaddleOCR: {e}")
             self.ocr = None
-            # Do not raise here, allow app to start without OCR
-            # raise e
+            self.initialized = True # Mark as tried
 
     def extract_text(self, image_path: str) -> str:
         """
@@ -51,21 +63,32 @@ class PrismOCR:
         Returns the combined text content.
         """
         try:
-            if not getattr(self, 'ocr', None):
-                logger.warning("PaddleOCR not initialized, skipping text extraction.")
+            if not self.initialized:
+                self._initialize()
+
+            if not self.ocr:
+                logger.warning("PaddleOCR not initialized or failed, skipping text extraction.")
                 return ""
 
+            # PaddleOCR 3.x predict() is the preferred way, ocr() is an alias
             result = self.ocr.ocr(image_path)
             if not result or result[0] is None:
                 return ""
 
-            # result structure: [[[[x1,y1],[x2,y2],...], ("text", confidence)], ...]
-            # We just want the text for now
             extracted_lines = []
-            for line in result:
-                for word_info in line:
-                    text = word_info[1][0]
-                    extracted_lines.append(text)
+            
+            # Handle PaddleOCR 3.x / PaddleX format (list of OCRResult/dict)
+            if isinstance(result[0], (dict, object)) and hasattr(result[0], 'get') and 'rec_texts' in result[0]:
+                for res in result:
+                    if 'rec_texts' in res:
+                        extracted_lines.extend(res['rec_texts'])
+            # Handle PaddleOCR 2.x format: [[[[box], (text, score)], ...]]
+            elif isinstance(result[0], list):
+                for line in result:
+                    for word_info in line:
+                        if isinstance(word_info, (list, tuple)) and len(word_info) > 1:
+                            text = word_info[1][0]
+                            extracted_lines.append(text)
             
             return "\n".join(extracted_lines)
 

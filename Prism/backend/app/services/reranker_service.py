@@ -9,7 +9,8 @@ class RerankerService:
     def __init__(self, model_name="cross-encoder/ms-marco-MiniLM-L-6-v2"):
         self.model_name = model_name
         self.model = None
-        self._load_model()
+        # Lazy load model on first use
+        # self._load_model()
 
     def _load_model(self):
         try:
@@ -23,7 +24,7 @@ class RerankerService:
             logger.error(f"Failed to load Reranker Model: {e}. Reranking will be disabled.")
             self.model = None
     
-    def rerank(self, query: str, candidates: List[Dict], top_k: int = 5, threshold: float = -3.0) -> List[Dict]:
+    def rerank(self, query: str, candidates: List[Dict], top_k: int = 5, threshold: float = -10.0) -> List[Dict]:
         """
         Rerank a list of candidates based on query relevance.
         candidates: List of dicts, each must have 'chunk' -> 'text'.
@@ -45,6 +46,9 @@ class RerankerService:
                 
         if not pairs:
             return []
+            
+        if not self.model:
+            self._load_model()
             
         if not self.model:
             return candidates[:top_k]

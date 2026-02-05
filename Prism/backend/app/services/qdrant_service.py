@@ -1,8 +1,7 @@
 import logging
 import uuid
 import threading
-from typing import List, Dict, Optional, Tuple, Any
-from pathlib import Path
+from typing import List, Dict, Optional
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from fastembed import SparseTextEmbedding
@@ -10,33 +9,38 @@ from .instructor_service import instructor_service
 
 logger = logging.getLogger(__name__)
 
+
+# =========================
+# Configuration
+# =========================
+
 class QdrantConfig:
-    """Centralized configuration for Qdrant Vector Service"""
-    # Local Path (No Docker)
     DB_PATH = "./qdrant_data"
     COLLECTION_NAME = "prism_vectors"
-    
-    # Embedding Dimensions (Must match model)
-    # Using 768 to match instructor-xl / all-mpnet-base-v2
-    VECTOR_SIZE = 768 
-    
-    # HNSW Index Configuration (Recall Optimized)
+
+    VECTOR_SIZE = 768  # all-mpnet-base-v2 / instructor-xl
+
+    # HNSW (recall-optimized)
     HNSW_M = 32
     HNSW_EF_CONSTRUCT = 200
     HNSW_FULL_SCAN_THRESHOLD = 10000
-    
-    # Search Configuration
-    SEARCH_EF = 128
-    
-    # Optimizer Configuration
-    INDEXING_THRESHOLD = 20000
-    
-    # Batch Size for Upserts
-    # Batch Size for Upserts
+
+    # Search
+    SEARCH_EF = 512   # MUST be >= 2x k
+
+    # Optimizer
+    INDEXING_THRESHOLD = 100000
+
+    # Ingestion
     BATCH_SIZE = 64
-    
-    # Sparse Model
+
+    # Sparse model
     SPARSE_MODEL_NAME = "Qdrant/bm25"
+
+
+# =========================
+# Vector Service
+# =========================
 
 class QdrantVectorService:
     def __init__(self):
@@ -44,197 +48,202 @@ class QdrantVectorService:
         self.client: Optional[QdrantClient] = None
         self._lock = threading.RLock()
         self._initialized = False
-        # Lazy load sparse model
-        self.sparse_model = None
-        
+        self.sparse_model: Optional[SparseTextEmbedding] = None
+
+    # -------------------------
+    # Initialization
+    # -------------------------
+
     def _ensure_initialized(self):
-        """Lazy initialization of Qdrant Client and Collection"""
         if self._initialized:
             return
 
         with self._lock:
             if self._initialized:
                 return
-                
-            try:
-                logger.info(f"Initializing Qdrant (Local) at {self.config.DB_PATH}...")
-                
-                # Initialize Client (Path-based, Persistent)
-                self.client = QdrantClient(path=self.config.DB_PATH)
-                
-                # Check if collection exists
-                collections = self.client.get_collections().collections
-                exists = any(c.name == self.config.COLLECTION_NAME for c in collections)
-                
-                if not exists:
-                    logger.info(f"Creating collection '{self.config.COLLECTION_NAME}'...")
-                    self.client.create_collection(
-                        collection_name=self.config.COLLECTION_NAME,
-                        vectors_config={
-                            "text-dense": models.VectorParams(
-                                size=self.config.VECTOR_SIZE,
-                                distance=models.Distance.COSINE
-                            )
-                        },
-                        sparse_vectors_config={
-                            "text-sparse": models.SparseVectorParams(
-                                index=models.SparseIndexParams(
-                                    on_disk=True,
-                                )
-                            )
-                        },
-                        hnsw_config=models.HnswConfigDiff(
-                            m=self.config.HNSW_M,
-                            ef_construct=self.config.HNSW_EF_CONSTRUCT,
-                            full_scan_threshold=self.config.HNSW_FULL_SCAN_THRESHOLD
-                        ),
-                        optimizers_config=models.OptimizersConfigDiff(
-                            indexing_threshold=self.config.INDEXING_THRESHOLD,
-                            default_segment_number=2 
-                        ),
-                        # Disable quantization for max recall
-                        quantization_config=None 
-                    )
-                else:
-                    logger.info(f"Connected to existing collection '{self.config.COLLECTION_NAME}'.")
+
+            logger.info(f"Initializing Qdrant at {self.config.DB_PATH}")
+            self.client = QdrantClient(path=self.config.DB_PATH)
+
+            collections = self.client.get_collections().collections
+            exists = any(c.name == self.config.COLLECTION_NAME for c in collections)
+            if exists:
+                try:
+                    # Validate schema supports sparse vectors by checking collection info
+                    coll_info = self.client.get_collection(self.config.COLLECTION_NAME)
+                    has_sparse = False
+                    # Check if sparse_vectors config exists and contains "text-sparse"
+                    if hasattr(coll_info.config.params, 'sparse_vectors') and coll_info.config.params.sparse_vectors:
+                         if "text-sparse" in coll_info.config.params.sparse_vectors:
+                             has_sparse = True
                     
-                self._initialized = True
-            except Exception as e:
-                logger.error(f"Failed to initialize Qdrant: {e}", exc_info=True)
-                raise e
+                    if not has_sparse:
+                        logger.warning(f"Collection '{self.config.COLLECTION_NAME}' missing sparse vectors. Recreating...")
+                        self.client.delete_collection(self.config.COLLECTION_NAME)
+                        exists = False
+                except Exception as e:
+                    logger.warning(f"Failed to validate collection schema: {e}. Assuming recreation needed.")
+                    self.client.delete_collection(self.config.COLLECTION_NAME)
+                    exists = False
+
+            if not exists:
+                logger.info(f"Creating collection '{self.config.COLLECTION_NAME}'")
+
+                self.client.create_collection(
+                    collection_name=self.config.COLLECTION_NAME,
+                    vectors_config={
+                        "text-dense": models.VectorParams(
+                            size=self.config.VECTOR_SIZE,
+                            distance=models.Distance.COSINE
+                        )
+                    },
+                    sparse_vectors_config={
+                        "text-sparse": models.SparseVectorParams(
+                            index=models.SparseIndexParams(on_disk=True)
+                        )
+                    },
+                    hnsw_config=models.HnswConfigDiff(
+                        m=self.config.HNSW_M,
+                        ef_construct=self.config.HNSW_EF_CONSTRUCT,
+                        full_scan_threshold=self.config.HNSW_FULL_SCAN_THRESHOLD
+                    ),
+                    optimizers_config=models.OptimizersConfigDiff(
+                        indexing_threshold=self.config.INDEXING_THRESHOLD,
+                        default_segment_number=2
+                    ),
+                    quantization_config=None
+                )
+            else:
+                logger.info(f"Connected to existing collection '{self.config.COLLECTION_NAME}'")
+
+            self._initialized = True
+
+    # -------------------------
+    # Ingestion
+    # -------------------------
 
     def add_documents(self, chunks: List[Dict]):
-        """
-        Batch Upsert Documents
-        - Generates Embeddings
-        - Extracts Metadata (NO TEXT STORAGE in Qdrant)
-        - Batches requests
-        """
         self._ensure_initialized()
         if not chunks:
             return
 
-        total_chunks = len(chunks)
-        batch_size = self.config.BATCH_SIZE
-        
-        logger.info(f"Starting ingestion of {total_chunks} chunks to Qdrant...")
-        
-        # 1. Generate Embeddings (Batching handled by instructor service or here?)
-        # For simplicity and memory safety, let's process in batches entirely
-        
-        for i in range(0, total_chunks, batch_size):
-            batch = chunks[i : i + batch_size]
+        logger.info(f"Ingesting {len(chunks)} chunks into Qdrant")
+
+        for i in range(0, len(chunks), self.config.BATCH_SIZE):
+            batch = chunks[i:i + self.config.BATCH_SIZE]
+
+            # Deduplication: Hash chunks to avoid re-embedding identical content
+            import hashlib
             
-            try:
-                # A. Embed Dense
-                texts = [c.get("text", "") for c in batch]
-                dense_embeddings = instructor_service.encode_documents(texts)
+            unique_batch = []
+            seen_hashes = set()
+            
+            for chunk in batch:
+                chunk_text = chunk.get("text", "").strip()
+                text_hash = hashlib.sha256(chunk_text.encode('utf-8')).hexdigest()
                 
-                # B. Embed Sparse
+                if text_hash not in seen_hashes:
+                    seen_hashes.add(text_hash)
+                    unique_batch.append(chunk)
+            
+            if not unique_batch:
+                continue
+
+            texts = [c.get("text", "") for c in unique_batch]
+            dense_vectors = instructor_service.encode_documents(texts)
+
+            with self._lock:
                 if not self.sparse_model:
-                     logger.info(f"Loading Sparse Model {self.config.SPARSE_MODEL_NAME}...")
-                     self.sparse_model = SparseTextEmbedding(model_name=self.config.SPARSE_MODEL_NAME)
-                
-                # fastembed returns generator, convert to list
-                sparse_embeddings = list(self.sparse_model.embed(texts))
-                
-                points = []
-                for idx, chunk in enumerate(batch):
-                    # B. ID Generation
-                    # Use provided chunk_id or generate deterministic UUID based on file_id+index
-                    cid = chunk.get("chunk_id")
-                    if not cid:
-                        cid = str(uuid.uuid4())
-                    
-                    # Ensure Point ID is a valid UUID (Qdrant strict requirement or safer)
-                    # Helper to convert arbitrary string ID to UUIDv5
-                    try:
-                        point_id = str(uuid.UUID(cid)) # Check if already valid
-                    except:
-                        # Create deterministic UUID from string ID
-                        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, str(cid)))
-                        
-                    # C. Metadata Extraction (STRICTLY NO TEXT)
-                    # We only keep what's needed for filtering & joining
-                    payload = {
-                        "chunk_id": cid,
-                        "doc_id": chunk.get("file_id") or chunk.get("doc_id", "unknown"),
-                        "folder_id": chunk.get("folder_id", "unknown"),
-                        "source_name": chunk.get("source_file") or chunk.get("file_name", "unknown"),
-                        "page": chunk.get("page"),
-                        "chunk_index": chunk.get("chunk_index", 0),
-                        "file_type": chunk.get("file_type", "unknown")
-                    }
-                    
-                    # D. Construct Point
-                    points.append(models.PointStruct(
+                    logger.info(f"Loading sparse model {self.config.SPARSE_MODEL_NAME}")
+                    self.sparse_model = SparseTextEmbedding(self.config.SPARSE_MODEL_NAME)
+
+            sparse_vectors = list(self.sparse_model.embed(texts))
+
+            points = []
+            for idx, chunk in enumerate(unique_batch):
+                cid = str(chunk.get("chunk_id") or uuid.uuid4())
+                try:
+                    point_id = str(uuid.UUID(cid))
+                except Exception:
+                    point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, cid))
+
+                payload = {
+                    "chunk_id": cid,
+                    "doc_id": chunk.get("file_id") or chunk.get("doc_id", "unknown"),
+                    "folder_id": chunk.get("folder_id", "unknown"),
+                    "source_name": chunk.get("source_file", "unknown"),
+                    "page": chunk.get("page"),
+                    "chunk_index": chunk.get("chunk_index", 0),
+                    "file_type": chunk.get("file_type", "unknown"),
+                }
+
+                points.append(
+                    models.PointStruct(
                         id=point_id,
                         vector={
-                            "text-dense": dense_embeddings[idx].tolist(),
+                            "text-dense": dense_vectors[idx].tolist(),
                             "text-sparse": models.SparseVector(
-                                indices=sparse_embeddings[idx].indices.tolist(),
-                                values=sparse_embeddings[idx].values.tolist()
+                                indices=sparse_vectors[idx].indices.tolist(),
+                                values=sparse_vectors[idx].values.tolist()
                             )
                         },
                         payload=payload
-                    ))
-                
-                # E. Upsert Batch
+                    )
+                )
+
+            with self._lock:
                 self.client.upsert(
                     collection_name=self.config.COLLECTION_NAME,
                     points=points
                 )
-                
-            except Exception as e:
-                logger.error(f"Failed to upsert batch {i}-{i+len(batch)}: {e}")
-                # Continue? Or raise? For robustness, we log and continue, but strictly this might lose data.
-                # In strict mode, we might want to raise. Let's log heavily.
-                
-        logger.info(f"Completed ingestion of {total_chunks} chunks.")
 
-    def search(self, query: str, k: int = 40, folder_id: str = None, file_id: str = None) -> List[Dict]:
-        """
-        Retrieval
-        - Embed Query
-        - Filter by folder/file
-        - Return Scored Points (Chunk IDs)
-        """
+        logger.info("Ingestion completed")
+
+    # -------------------------
+    # Search
+    # -------------------------
+
+    def search(
+        self,
+        query: str,
+        k: int = 40,
+        folder_id: Optional[str] = None,
+        file_id: Optional[str] = None
+    ) -> List[Dict]:
+
         self._ensure_initialized()
-        
-        # 1. Embed
+
         query_vec = instructor_service.encode_query(query).tolist()
-        
-        # 2. Build Filter
-        filter_conditions = []
+
+        conditions = []
         if folder_id:
-            filter_conditions.append(
-                models.FieldCondition(key="folder_id", match=models.MatchValue(value=folder_id))
-            )
+            conditions.append(models.FieldCondition(
+                key="folder_id",
+                match=models.MatchValue(value=folder_id)
+            ))
         if file_id:
-             filter_conditions.append(
-                models.FieldCondition(key="doc_id", match=models.MatchValue(value=file_id))
-            )
+            conditions.append(models.FieldCondition(
+                key="doc_id",
+                match=models.MatchValue(value=file_id)
+            ))
 
-        q_filter = None
-        if filter_conditions:
-            q_filter = models.Filter(must=filter_conditions)
+        q_filter = models.Filter(must=conditions) if conditions else None
+        ef = max(self.config.SEARCH_EF, k * 2)
 
-        # 3. Search (Hybrid)
+        # -------- Hybrid Search --------
         try:
-             # Ensure sparse model loaded for query
             if not self.sparse_model:
-                 self.sparse_model = SparseTextEmbedding(model_name=self.config.SPARSE_MODEL_NAME)
-            
+                self.sparse_model = SparseTextEmbedding(self.config.SPARSE_MODEL_NAME)
+
             sparse_q = list(self.sparse_model.embed([query]))[0]
-            
-            # Hybrid Query using Prefetch
+
             results = self.client.query_points(
                 collection_name=self.config.COLLECTION_NAME,
                 prefetch=[
                     models.Prefetch(
                         using="text-sparse",
                         query=models.SparseVector(
-                            indices=sparse_q.indices.tolist(), 
+                            indices=sparse_q.indices.tolist(),
                             values=sparse_q.values.tolist()
                         ),
                         limit=k,
@@ -244,64 +253,56 @@ class QdrantVectorService:
                         using="text-dense",
                         query=query_vec,
                         limit=k,
-                        filter=q_filter
+                        filter=q_filter,
+                        params=models.SearchParams(hnsw_ef=ef)
                     )
                 ],
-                # RRF Fusion
-                query=models.FusionQuery(method=models.Fusion.RRF),
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
                 limit=k
             ).points
-            
-        except Exception as e:
-            logger.error(f"Hybrid search failed: {e}. Falling back to Dense Only.")
-            # Fallback to old search if query_points/fusion not supported by server/client version
-            try:
-                 results = self.client.search(
-                    collection_name=self.config.COLLECTION_NAME,
-                    query_vector=models.NamedVector(
-                        name="text-dense",
-                        vector=query_vec
-                    ),
-                    query_filter=q_filter,
-                    limit=k
-                )
-            except Exception as e2:
-                 logger.error(f"Fallback Search failed: {e2}")
-                 return []
 
-        # 4. Format Results
-        # Return format expected by QA Service: {"id":..., "score":..., "payload":...}
-        # Note: 'chunk' (text) is NOT returned here. QA Service must hydrate it.
-        formatted_results = []
-        for point in results:
-            formatted_results.append({
-                "id": point.id,
-                "score": point.score,
-                "payload": point.payload, # Contains chunk_id, doc_id
-                "chunk_id": point.payload.get("chunk_id", point.id)
-            })
-            
-        return formatted_results
+        except Exception as e:
+            logger.error(f"Hybrid search failed: {e}. Falling back to dense-only.")
+
+            results = self.client.query_points(
+                collection_name=self.config.COLLECTION_NAME,
+                query=query_vec,
+                using="text-dense",
+                limit=k,
+                filter=q_filter,
+                params=models.SearchParams(hnsw_ef=ef)
+            ).points
+
+        if not results:
+            logger.error("Qdrant returned 0 results — retrieval failure")
+            return []
+
+        logger.info(f"[QDRANT] Retrieved {len(results)} points")
+
+        return [
+            {
+                "id": p.id,
+                "score": p.score,
+                "payload": p.payload,
+                "chunk_id": p.payload.get("chunk_id", p.id)
+            }
+            for p in results
+        ]
+
+    # -------------------------
+    # Utilities
+    # -------------------------
 
     def delete_collection(self):
-        """Destructive: Clear all data"""
         self._ensure_initialized()
-        try:
-            self.client.delete_collection(self.config.COLLECTION_NAME)
-            # Re-init (create empty) handled by lazy logic on next call, 
-            # but to be safe we can force re-init state
-            self._initialized = False
-            logger.info("Collection deleted.")
-        except Exception as e:
-            logger.error(f"Failed to delete collection: {e}")
+        self.client.delete_collection(self.config.COLLECTION_NAME)
+        self._initialized = False
+        logger.warning("Qdrant collection deleted")
 
     def get_count(self) -> int:
         self._ensure_initialized()
-        try:
-            info = self.client.get_collection(self.config.COLLECTION_NAME)
-            return info.points_count
-        except:
-            return 0
+        return self.client.get_collection(self.config.COLLECTION_NAME).points_count
 
-# Singleton Instance
+
+# Singleton
 qdrant_service = QdrantVectorService()

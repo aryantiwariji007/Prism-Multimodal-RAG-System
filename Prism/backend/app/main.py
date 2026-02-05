@@ -1,8 +1,8 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Form
-try:
-    import torch
-except ImportError:
-    pass # Handle gracefully if torch is missing entirely
+# try:
+#     import torch
+# except ImportError:
+#     pass # Handle gracefully if torch is missing entirely
 
 
 # ... (omitting lines for brevity, the tool finds the import line by context or I replace just the import)
@@ -339,12 +339,13 @@ async def ask_video_question(request: VideoQuestionRequest):
 # -------------------------------------------------
 # Processing status (FIXED)
 # -------------------------------------------------
-
 from .services.ingestion_service import ingestion_service
 
 @app.on_event("startup")
 async def startup_event():
     await ingestion_service.start()
+    if os.getenv("ENABLE_BACKGROUND_INGESTION", "false").lower() != "true":
+        logger.info("Background ingestion service is disabled. Files will stay in 'pending' status.")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -439,8 +440,9 @@ async def upload_document(
         except Exception as e:
             logger.error(f"Failed to assign file {file_id} to folder {folder_id}: {e}")
 
-    # Use IngestionService (Async & Persistent)
-    ingestion_service.add_job(str(upload_path), file_id, folder_id)
+    # Use IngestionService (FAST SYNC & Synchronous)
+    import asyncio
+    await ingestion_service.process_document_sync(upload_path, file_id, folder_id)
 
     return {
         "success": True,

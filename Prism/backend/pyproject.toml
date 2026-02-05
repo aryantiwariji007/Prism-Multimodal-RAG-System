@@ -24,7 +24,12 @@ dependencies = [
     "websockets==15.0.1",
     "orjson==3.11.3",
     "tenacity==8.5.0",
-    "python-json-logger==2.0.7"
+    "python-json-logger==2.0.7",
+    "chromadb",
+    "sentence-transformers",
+    "paddlepaddle",
+    "paddleocr>=2.7.0",
+    "opencv-python-headless"
 ]
 
 [project.optional-dependencies]

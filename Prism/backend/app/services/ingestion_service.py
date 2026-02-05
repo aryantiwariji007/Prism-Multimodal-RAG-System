@@ -4,6 +4,7 @@ import json
 import logging
 import uuid
 import os
+import base64
 from pathlib import Path
 from datetime import datetime
 from enum import Enum
@@ -41,8 +42,9 @@ class IngestionService:
         self._init_db()
         self._queue = asyncio.PriorityQueue()
         self._running = False
-        self._worker_task = None
+        self._worker_tasks = []
         self._loop = None
+        self._gpu_semaphore = asyncio.Semaphore(2)  # Limit concurrent GPU usage
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -60,27 +62,40 @@ class IngestionService:
             """)
             conn.commit()
 
-    async def start(self):
+    async def start(self, force=False):
         """Start the background worker"""
         if self._running:
             return
         
+        # Check if background ingestion is enabled
+        enable_bg = os.getenv("ENABLE_BACKGROUND_INGESTION", "false").lower() == "true"
+        if not enable_bg and not force:
+            logger.info("Background Ingestion Service is DISABLED via configuration.")
+            return
+
         self._running = True
-        # Load pending jobs from DB
         self._load_pending_jobs()
         
         self._loop = asyncio.get_event_loop()
-        self._worker_task = self._loop.create_task(self._worker_loop())
-        logger.info("Ingestion Service started.")
-
+        
+        # Parallel Worker Pool (e.g., 3 concurrent file parsers)
+        # This allows CPU tasks (parsing) to run while GPU is busy
+        logger.info("Starting Ingestion Service with 3 concurrent workers...")
+        self._worker_tasks = [
+            self._loop.create_task(self._worker_loop(), name=f"ingest_worker_{i}") 
+            for i in range(3)
+        ]
+        
     async def stop(self):
         self._running = False
-        if self._worker_task:
-            self._worker_task.cancel()
-            try:
-                await self._worker_task
-            except asyncio.CancelledError:
-                pass
+        if self._worker_tasks:
+            for task in self._worker_tasks:
+                task.cancel()
+            
+            # Wait for all to cancel
+            await asyncio.gather(*self._worker_tasks, return_exceptions=True)
+            self._worker_tasks = []
+            
         logger.info("Ingestion Service stopped.")
 
     def _load_pending_jobs(self):
@@ -127,18 +142,19 @@ class IngestionService:
         return None
 
     async def _worker_loop(self):
-        logger.info("Worker loop started.")
+        worker_name = asyncio.current_task().get_name()
+        logger.info(f"Worker {worker_name} started.")
         while self._running:
             try:
                 priority, file_id = await self._queue.get()
-                logger.info(f"Picking up job {file_id} (Priority {priority})")
+                logger.info(f"[{worker_name}] Picking up job {file_id} (Priority {priority})")
                 
                 await self._process_job(file_id)
                 self._queue.task_done()
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Worker error: {e}")
+                logger.error(f"Worker {worker_name} error: {e}")
                 await asyncio.sleep(1)
 
     async def _process_job(self, file_id: str):
@@ -198,7 +214,13 @@ class IngestionService:
             # Commit Stage 1 to Vector DB
             # Note: We do this even if Stage 1 yields partial results
             if chunks:
-                await asyncio.to_thread(qdrant_service.add_documents, chunks)
+                # CRITICAL: Inject folder_id so Qdrant filtering works
+                for chunk in chunks:
+                    chunk["folder_id"] = job.folder_id
+
+                # Limit concurrent Embeddings
+                async with self._gpu_semaphore:
+                    await asyncio.to_thread(qdrant_service.add_documents, chunks)
                 logger.info(f"Stage 1 Complete for {file_id}: {len(chunks)} text chunks indexed in Qdrant.")
                 
                 # --- SAVE METADATA (Critical for System Visibility) ---
@@ -237,8 +259,13 @@ class IngestionService:
                 self._update_status(file_id, IngestionStatus.PROCESSING_STAGE_2, 2)
                 # Re-queue for Stage 2 if we wanted to yield, but here we just continue
                 # Run Stage 2
-                enrichment_chunks = await asyncio.to_thread(self._run_stage_2, file_path, file_id)
+                # Run Stage 2 with semaphore
+                async with self._gpu_semaphore:
+                    enrichment_chunks = await asyncio.to_thread(self._run_stage_2, file_path, file_id)
                 if enrichment_chunks:
+                     for chunk in enrichment_chunks:
+                         chunk["folder_id"] = job.folder_id
+                         
                      await asyncio.to_thread(qdrant_service.add_documents, enrichment_chunks)
                      logger.info(f"Stage 2 Complete for {file_id}: {len(enrichment_chunks)} enrichment chunks indexed in Qdrant.")
                      
@@ -398,6 +425,104 @@ class IngestionService:
 
         return chunks
 
+    async def process_document_sync(self, file_path: Path, file_id: str, folder_id: str = None):
+        """
+        Ultra-fast Synchronous Ingestion Pipeline:
+        1. Parallel Parsing (CPU)
+        2. Batched Embeddings (GPU)
+        3. Periodic Qdrant Sync (Streaming)
+        """
+        logger.info(f"Starting FAST SYNC ingestion for {file_id}")
+        
+        # 1. Page/Content Extraction
+        suffix = file_path.suffix.lower()
+        chunks = []
+        
+        # For PDF, we can parallelize page parsing
+        if suffix == '.pdf':
+            chunks = await self._process_pdf_fast(file_path, file_id, folder_id)
+        else:
+            # Fallback to standard fast stage 1 for other types
+            chunks = await asyncio.to_thread(self._run_stage_1, file_path, file_id)
+            
+        if not chunks:
+            logger.warning(f"No chunks extracted for {file_id}")
+            return {"success": False, "error": "No content extracted"}
+
+        # 2. Inject folder_id
+        for chunk in chunks:
+            chunk["folder_id"] = folder_id
+
+        # 3. Batch Embed & Index (Streaming happens inside add_documents in batches of 64)
+        async with self._gpu_semaphore:
+            await asyncio.to_thread(qdrant_service.add_documents, chunks)
+
+        # 4. Save Metadata & Update QA Service
+        from ..services.qa_service import qa_service
+        metadata = {
+            "file_id": file_id,
+            "file_name": file_path.name,
+            "file_path": str(file_path),
+            "type": suffix.replace('.', ''),
+            "num_chunks": len(chunks),
+            "total_characters": sum(len(c.get("text", "")) for c in chunks),
+            "ingestion_status": "completed"
+        }
+        
+        qa_service.document_chunks[file_id] = chunks
+        qa_service.document_metadata[file_id] = metadata
+        
+        await asyncio.to_thread(
+            qa_service._save_processed_document, 
+            file_id, 
+            chunks, 
+            metadata
+        )
+        
+        logger.info(f"FAST SYNC Ingestion Complete: {file_id}")
+        return {"success": True, "num_chunks": len(chunks)}
+
+    async def _process_pdf_fast(self, file_path: Path, file_id: str, folder_id: str) -> List[Dict]:
+        """Parallelized PDF parsing"""
+        import pdfplumber
+        from concurrent.futures import ThreadPoolExecutor
+        
+        all_chunks = []
+        
+        def parse_page(page_num, page_text):
+            if not page_text.strip():
+                return []
+            # Use chunker to split text
+            from ingestion.chunker import document_chunker
+            page_chunks = document_chunker.chunk_text(page_text, file_id, file_name=file_path.name)
+            for c in page_chunks:
+                c["page"] = page_num
+                c["ingestion_method"] = "fast_parallel_parsing"
+            return page_chunks
+
+        try:
+            with pdfplumber.open(file_path) as pdf:
+                pages_data = []
+                for i, page in enumerate(pdf.pages):
+                    pages_data.append((i + 1, page.extract_text() or ""))
+                
+                # Use ThreadPool to chunk pages in parallel
+                with ThreadPoolExecutor(max_workers=min(len(pages_data), 8)) as executor:
+                    loop = asyncio.get_event_loop()
+                    tasks = [
+                        loop.run_in_executor(executor, parse_page, p_num, p_text)
+                        for p_num, p_text in pages_data
+                    ]
+                    results = await asyncio.gather(*tasks)
+                    for r in results:
+                        all_chunks.extend(r)
+        except Exception as e:
+            logger.error(f"Fast PDF parsing failed: {e}")
+            # Fallback to standard
+            all_chunks = await asyncio.to_thread(self._run_stage_1, file_path, file_id)
+            
+        return all_chunks
+
     def _run_pdf_ocr(self, file_path: Path, file_id: str) -> List[Dict]:
         """Convert PDF pages to images and run OCR (with LLaVA fallback)"""
         ocr_chunks = []
@@ -405,7 +530,7 @@ class IngestionService:
             import pdfplumber
             from ingestion.ocr_image import prism_ocr
             from ingestion.chunker import document_chunker
-            from ..services.llm_service import llm_service
+            from ..services.llm_service import ollama_llm as llm_service
             
             with pdfplumber.open(file_path) as pdf:
                 for i, page in enumerate(pdf.pages):
@@ -427,7 +552,16 @@ class IngestionService:
                         try:
                             # Use a specific OCR prompt for the vision model
                             ocr_prompt = "Transcribe all the text you see in this image exactly, including names and numbers. Return only the transcription."
-                            page_text = llm_service.analyze_image(temp_img_path, ocr_prompt)
+                            
+                            # Read and encode image
+                            with open(temp_img_path, "rb") as image_file:
+                                image_base64 = base64.b64encode(image_file.read()).decode('utf-8')
+                            
+                            # Correct method call
+                            page_text = llm_service.generate_vision_response(
+                                prompt=ocr_prompt, 
+                                image_base64=image_base64
+                            )
                             logger.info(f"LLaVA OCR successful for page {i+1}")
                         except Exception as llm_e:
                             logger.error(f"LLaVA fallback failed: {llm_e}")
