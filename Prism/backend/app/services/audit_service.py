@@ -14,15 +14,15 @@ class AuditService:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.log_file = self.log_dir / "rag_audit_log.jsonl"
         
-        # Clear log file on startup (session-based history)
-        if self.log_file.exists():
-            try:
-                # Truncate file
-                with open(self.log_file, "w", encoding="utf-8") as f:
-                    pass
-                logger.info("Cleared audit log for new session")
-            except Exception as e:
-                logger.error(f"Failed to clear audit log: {e}")
+        # Persistence: Do NOT clear log file on startup anymore
+        # if self.log_file.exists():
+        #     try:
+        #         # Truncate file
+        #         with open(self.log_file, "w", encoding="utf-8") as f:
+        #             pass
+        #         logger.info("Cleared audit log for new session")
+        #     except Exception as e:
+        #         logger.error(f"Failed to clear audit log: {e}")
 
     def log_event(self, event_type: str, data: Dict[str, Any]):
         """

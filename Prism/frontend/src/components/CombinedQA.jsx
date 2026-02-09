@@ -172,7 +172,13 @@ const CombinedQA = () => {
 
         try {
             let endpoint = 'http://localhost:8000/api/question'
-            let body = { question: userMessage }
+            let body = {
+                question: userMessage,
+                history: messages.slice(-10).map(m => ({
+                    role: m.role,
+                    content: m.content
+                }))
+            }
 
             if (selectedContext) {
                 if (selectedContext.type === 'folder') {
@@ -202,7 +208,13 @@ const CombinedQA = () => {
                         const chatRes = await fetch('http://localhost:8000/api/chat', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ message: userMessage })
+                            body: JSON.stringify({
+                                message: userMessage,
+                                history: messages.slice(-10).map(m => ({
+                                    role: m.role,
+                                    content: m.content
+                                }))
+                            })
                         })
                         const chatData = await chatRes.json()
                         if (chatData.success) {

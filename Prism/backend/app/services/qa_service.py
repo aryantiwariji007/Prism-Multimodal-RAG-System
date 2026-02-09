@@ -350,6 +350,7 @@ Output format (JSON ONLY):
         question: str,
         file_id: str = None,
         folder_id: str = None,
+        history: List[Dict] = None,
         max_chunks: int = 10
     ) -> Dict:
         start_time = time.time()
@@ -431,7 +432,7 @@ Output format (JSON ONLY):
             else:
                 t_gen_start = time.time()
                 # Pass "Antigravity" compliant instructions via system prompt override
-                answer = ollama_llm.answer_question(context, question)
+                answer = ollama_llm.answer_question(context, question, history)
                 t_gen_end = time.time()
                 logger.info(f"[TIMER] Final LLM Generation: {(t_gen_end - t_gen_start)*1000:.2f}ms")
                 sources = self._extract_sources(relevant_chunks)

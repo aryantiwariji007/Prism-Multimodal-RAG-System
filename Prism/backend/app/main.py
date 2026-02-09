@@ -74,6 +74,7 @@ class QuestionRequest(BaseModel):
     question: str
     file_id: Optional[str] = None
     folder_id: Optional[str] = None
+    history: Optional[list] = []
 
 class QuestionResponse(BaseModel):
     success: bool
@@ -84,6 +85,7 @@ class QuestionResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
+    history: Optional[list] = []
 
 class ChatResponse(BaseModel):
     success: bool
@@ -468,6 +470,7 @@ async def chat(request: ChatRequest):
         prompt=request.message,
         max_tokens=512,
         temperature=0.7,
+        history=request.history
     )
 
     # Log to audit history
@@ -496,6 +499,7 @@ async def ask_question(request: QuestionRequest):
         question=request.question,
         file_id=request.file_id,
         folder_id=request.folder_id,
+        history=request.history
     )
 
     if result["success"]:

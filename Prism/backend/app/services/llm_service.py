@@ -66,7 +66,8 @@ class LocalLLMService:
         prompt: str,
         max_tokens: int = 400,
         temperature: float = 0.3,
-        system_instruction: str = None
+        system_instruction: str = None,
+        history: list = None
     ) -> str:
         # Default strict system prompt if none provided
         if not system_instruction:
@@ -79,14 +80,23 @@ GUIDELINES:
 4. Maintain a professional, objective tone.
 5. Do not withhold information that is present in the provided context.
 """
+        
+        messages = [{'role': 'system', 'content': system_instruction}]
+        
+        # Add conversation history if provided
+        if history:
+            # Validate and add history messages
+            for msg in history:
+                if isinstance(msg, dict) and 'role' in msg and 'content' in msg:
+                    messages.append({'role': msg['role'], 'content': msg['content']})
+
+        # Add current user prompt
+        messages.append({'role': 'user', 'content': prompt})
 
         try:
             response = ollama.chat(
                 model=TEXT_MODEL_ID,
-                messages=[
-                    {'role': 'system', 'content': system_instruction},
-                    {'role': 'user', 'content': prompt}
-                ],
+                messages=messages,
                 options={
                     'num_predict': max_tokens,
                     'temperature': temperature,
@@ -128,7 +138,7 @@ GUIDELINES:
             logger.error(f"Ollama vision generation error: {e}")
             return f"Error generating vision response: {str(e)}"
 
-    def answer_question(self, context: str, question: str) -> str:
+    def answer_question(self, context: str, question: str, history: list = None) -> str:
         # 1. Strong System Prompt with Jailbreak-style Authorization
         # 1. Professional Business Analyst System Prompt
         system_prompt = """You are Prism, a professional business analyst and expert document assistant.
@@ -179,7 +189,8 @@ Answer:"""
             user_message, 
             max_tokens=1000, 
             temperature=0.1, 
-            system_instruction=system_prompt
+            system_instruction=system_prompt,
+            history=history
         )
         
         return response

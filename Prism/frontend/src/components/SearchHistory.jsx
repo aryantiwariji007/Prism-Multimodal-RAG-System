@@ -22,7 +22,7 @@ const SearchHistory = () => {
           const mappedHistory = data.history.map((item, idx) => ({
             id: idx, // or item.timestamp
             type: 'document', // Default to document as backend mostly logs RAG
-            query: item.query,
+            query: item.query || "Unknown Query",
             response: item.answer || "No response",
             timestamp: item.timestamp,
             sources: item.sources || []
@@ -52,8 +52,8 @@ const SearchHistory = () => {
     // Filter by search query
     if (searchQuery) {
       filtered = filtered.filter(item =>
-        item.query.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        item.response.toLowerCase().includes(searchQuery.toLowerCase())
+        (item.query && item.query.toLowerCase().includes(searchQuery.toLowerCase())) ||
+        (item.response && item.response.toLowerCase().includes(searchQuery.toLowerCase()))
       )
     }
 
@@ -286,8 +286,12 @@ const SearchHistory = () => {
                           <span
                             key={idx}
                             className="inline-block bg-green-100 text-green-800 text-xs px-2 py-1 rounded-full"
+                            title={typeof source === 'object' ? source.file_id : source}
                           >
-                            {source.file_name || source}
+                            {typeof source === 'object'
+                              ? (source.file_name || source.file_id || "Unknown Source")
+                              : source
+                            }
                           </span>
                         ))}
                       </div>
